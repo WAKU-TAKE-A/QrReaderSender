@@ -1,18 +1,23 @@
 {
-  "name": "qrreadersender",
-  "version": "1.0.0",
+  "name": "QrReaderSender",
+  "version": "1.0.1",
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "web": "expo start --web"
   },
   "dependencies": {
+    "@react-native-community/cli": "latest",
     "expo": "~52.0.46",
+    "expo-dev-client": "~5.0.20",
     "expo-status-bar": "~2.0.1",
     "react": "18.3.1",
-    "react-native": "0.76.9"
+    "react-native": "0.76.9",
+    "react-native-permissions": "^5.2.1",
+    "react-native-reanimated": "^3.16.6",
+    "react-native-vision-camera": "^4.6.3"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",

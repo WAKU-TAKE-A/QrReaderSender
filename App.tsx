@@ -61,7 +61,6 @@ export default function App() {
     if (qrCodes.length === 0 || isSending) return;
 
     setIsSending(true);
-    setIsCameraActive(false); // 念のためSTOP
     const joinedCodes = qrCodes.join(',');
 
     try {
@@ -114,7 +113,7 @@ export default function App() {
         <Button
           title="SEND"
           onPress={handleSend}
-          disabled={!isCameraActive || qrCodes.length === 0 || isSending}
+          disabled={isCameraActive || qrCodes.length === 0 || isSending}
         />
 
         {isSending && (

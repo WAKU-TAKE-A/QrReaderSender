@@ -7,7 +7,10 @@ import {
   Text,
   TextInput,
   ActivityIndicator,
+  FlatList,
+  Vibration,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   Camera,
   useCameraDevice,
@@ -15,6 +18,8 @@ import {
   useCameraFormat,
   useCodeScanner,
 } from 'react-native-vision-camera';
+
+const STORAGE_KEY = 'endpointUrl';
 
 export default function App() {
   const [isCameraActive, setIsCameraActive] = useState(false);
@@ -25,7 +30,7 @@ export default function App() {
   const cameraRef = useRef(null);
 
   const device = useCameraDevice('back');
-  const format = useCameraFormat(device, [{ fps: 2 }]);
+  const format = useCameraFormat(device, [{ fps: 10 }]);
   const { hasPermission, requestPermission } = useCameraPermission();
 
   useEffect(() => {
@@ -33,6 +38,17 @@ export default function App() {
       requestPermission();
     }
   }, []);
+
+  useEffect(() => {
+    (async () => {
+      const stored = await AsyncStorage.getItem(STORAGE_KEY);
+      if (stored) setEndpointUrl(stored);
+    })();
+  }, []);
+
+  useEffect(() => {
+    AsyncStorage.setItem(STORAGE_KEY, endpointUrl);
+  }, [endpointUrl]);
 
   const codeScanner = useCodeScanner({
     codeTypes: ['qr'],
@@ -47,12 +63,13 @@ export default function App() {
       }
 
       if (newCodes.length > 0) {
+        Vibration.vibrate(100);
         setIsScanning(false);
         setQrCodes((prev) => {
           const combined = [...prev, ...newCodes];
-          return [...new Set(combined)]; // 重複除去
+          return [...new Set(combined)];
         });
-        setTimeout(() => setIsScanning(true), 300); // 自動で再開
+        setTimeout(() => setIsScanning(true), 100);
       }
     },
   });
@@ -61,6 +78,7 @@ export default function App() {
     if (qrCodes.length === 0 || isSending) return;
 
     setIsSending(true);
+    setIsCameraActive(false);
     const joinedCodes = qrCodes.join(',');
 
     try {
@@ -69,13 +87,31 @@ export default function App() {
       const text = await response.text();
       Alert.alert('送信結果', `Status: ${response.status}\n\n${text}`);
       if (response.ok) {
-        setQrCodes([]); // 成功時にリセット
+        setQrCodes([]);
       }
     } catch (error) {
       Alert.alert('送信エラー', `${error}`);
     } finally {
       setIsSending(false);
     }
+  };
+
+  const handleReset = () => {
+    Alert.alert(
+      'Confirm',
+      'Are you sure you want to delete scanned data?',
+      [
+        {
+          text: 'No',
+          style: 'cancel',
+        },
+        {
+          text: 'Yes',
+          onPress: () => setQrCodes([]),
+        },
+      ],
+      { cancelable: true }
+    );
   };
 
   if (device == null) return <Text>Loading camera...</Text>;
@@ -110,11 +146,19 @@ export default function App() {
           placeholder="送信先URL"
         />
 
-        <Button
-          title="SEND"
-          onPress={handleSend}
-          disabled={isCameraActive || qrCodes.length === 0 || isSending}
-        />
+        <View style={styles.row}>
+          <Button
+            title="SEND"
+            onPress={handleSend}
+            disabled={!isCameraActive || qrCodes.length === 0 || isSending}
+          />
+          <View style={{ width: 10 }} />
+          <Button
+            title="RESET"
+            onPress={handleReset}
+            color="red"
+          />
+        </View>
 
         {isSending && (
           <ActivityIndicator size="small" color="#00ffcc" style={{ marginTop: 10 }} />
@@ -128,6 +172,22 @@ export default function App() {
             return ` (${preview})`;
           })()}
         </Text>
+
+        {qrCodes.length > 0 && (
+          <FlatList
+            style={{ marginTop: 10, maxHeight: 200 }}
+            data={qrCodes
+              .map((code, index) => ({ code, index }))
+              .slice(-5)
+              .reverse()}
+            renderItem={({ item }) => (
+              <Text style={{ color: 'white' }}>
+                {item.index + 1}: {item.code}
+              </Text>
+            )}
+            keyExtractor={(item) => item.index.toString()}
+          />
+        )}
       </View>
     </View>
   );
@@ -156,5 +216,10 @@ const styles = StyleSheet.create({
   qrInfo: {
     color: 'white',
     marginTop: 10,
+  },
+  row: {
+    marginTop: 10,
+    flexDirection: 'row',
+    justifyContent: 'center',
   },
 });

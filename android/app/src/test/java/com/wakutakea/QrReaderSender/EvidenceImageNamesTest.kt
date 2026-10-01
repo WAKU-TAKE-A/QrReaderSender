@@ -33,4 +33,13 @@ class EvidenceImageNamesTest {
     assertEquals("QR_2026_0913_143025_007.jpg", EvidenceImageNames.fileName("", timestamp))
     assertEquals("QR_2026_0913_143025_007.jpg", EvidenceImageNames.fileName("...", timestamp))
   }
+
+  @Test fun textExportUsesRequestedNameAndOneLinePerCode() {
+    assertEquals("QR_2026_0913_143025_007.txt", QrTextExport.fileName(timestamp))
+    assertEquals("QR01\nQR02\nQR03\n", QrTextExport.contents(listOf("QR01", "QR02", "QR03")))
+  }
+
+  @Test fun textExportEscapesEmbeddedLineBreaks() {
+    assertEquals("line1\\nline2\n", QrTextExport.contents(listOf("line1\nline2")))
+  }
 }

@@ -20,6 +20,87 @@ class EvidenceImagesModule(private val context: ReactApplicationContext) : React
   override fun getName() = "EvidenceImages"
 
   @ReactMethod
+  fun saveQrText(codes: ReadableArray, timestamp: Double, promise: Promise) {
+    val values = (0 until codes.size()).map { codes.getString(it) ?: "" }
+    executor.execute {
+      try {
+        require(values.isNotEmpty()) { "There are no QR codes to save" }
+        val bytes = QrTextExport.contents(values).toByteArray(Charsets.UTF_8)
+        var time = timestamp.toLong()
+        var relativePath: String
+        var name: String
+        do {
+          relativePath = "QrReaderSender/${EvidenceImageNames.folder(time)}"
+          name = QrTextExport.fileName(time++)
+        } while (downloadFileExists(relativePath, name))
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+          saveTextToDownloads(bytes, relativePath, name)
+        } else {
+          saveTextToLegacyDownloads(bytes, relativePath, name)
+        }
+        promise.resolve("$relativePath/$name")
+      } catch (error: Exception) {
+        promise.reject("TEXT_SAVE_FAILED", "テキストの保存に失敗しました: ${error.message}", error)
+      }
+    }
+  }
+
+  private fun downloadFileExists(relativePath: String, name: String): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+      @Suppress("DEPRECATION")
+      val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+      return File(directory, "$relativePath/$name").exists()
+    }
+    val resolver = context.contentResolver
+    val path = "${Environment.DIRECTORY_DOWNLOADS}/$relativePath/"
+    resolver.query(
+      MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+      arrayOf(MediaStore.MediaColumns._ID),
+      "${MediaStore.MediaColumns.RELATIVE_PATH} = ? AND ${MediaStore.MediaColumns.DISPLAY_NAME} = ?",
+      arrayOf(path, name),
+      null
+    )?.use { return it.moveToFirst() }
+    return false
+  }
+
+  @android.annotation.TargetApi(Build.VERSION_CODES.Q)
+  private fun saveTextToDownloads(bytes: ByteArray, relativePath: String, name: String) {
+    val resolver = context.contentResolver
+    val values = ContentValues().apply {
+      put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+      put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+      put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/$relativePath")
+      put(MediaStore.MediaColumns.IS_PENDING, 1)
+    }
+    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+      ?: throw IOException("Download entry could not be created")
+    try {
+      resolver.openOutputStream(uri)?.use { it.write(bytes) }
+        ?: throw IOException("Download file could not be opened")
+      val updated = resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+      if (updated != 1) throw IOException("Download file could not be published")
+    } catch (error: Exception) {
+      resolver.delete(uri, null, null)
+      throw error
+    }
+  }
+
+  @Suppress("DEPRECATION")
+  private fun saveTextToLegacyDownloads(bytes: ByteArray, relativePath: String, name: String) {
+    val directory = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), relativePath)
+    if (!directory.isDirectory && !directory.mkdirs()) throw IOException("Download folder could not be created")
+    val destination = File(directory, name)
+    if (!destination.createNewFile()) throw IOException("Text file already exists: $name")
+    try {
+      destination.outputStream().use { it.write(bytes) }
+    } catch (error: Exception) {
+      destination.delete()
+      throw error
+    }
+    MediaScannerConnection.scanFile(context, arrayOf(destination.absolutePath), arrayOf("text/plain"), null)
+  }
+
+  @ReactMethod
   fun saveSnapshot(path: String, codes: ReadableArray, timestamp: Double, promise: Promise) {
     val values = (0 until codes.size()).map { codes.getString(it) ?: "QR" }
     executor.execute {

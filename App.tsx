@@ -30,6 +30,7 @@ const IMAGE_CAPTURE_DELAYS = [0, 50, 75, 100, 250, 500] as const;
 type ImageCaptureDelay = typeof IMAGE_CAPTURE_DELAYS[number];
 const evidenceImages = NativeModules.EvidenceImages as {
   saveSnapshot(path: string, codes: string[], timestamp: number): Promise<void>;
+  saveQrText(codes: string[], timestamp: number): Promise<string>;
 } | undefined;
 
 export default function App() {
@@ -80,9 +81,9 @@ export default function App() {
     ]).catch((error) => Alert.alert('設定保存エラー', String(error)));
   }, [endpointUrl, imageCaptureDelay, settingsLoaded]);
 
-  const ensureImagePermission = async () => {
+  const ensureDownloadPermission = async () => {
     if (Platform.OS !== 'android' || !evidenceImages) {
-      Alert.alert('画像保存', '画像保存に対応したAndroidビルドが必要です。');
+      Alert.alert('ファイル保存', 'ファイル保存に対応したAndroidビルドが必要です。');
       return false;
     }
     if (Number(Platform.Version) >= 29) return true;
@@ -90,7 +91,7 @@ export default function App() {
     if (await PermissionsAndroid.check(permission)) return true;
     const result = await PermissionsAndroid.request(permission);
     if (result === PermissionsAndroid.RESULTS.GRANTED) return true;
-    Alert.alert('画像保存', 'ダウンロードフォルダへの保存にはストレージ権限が必要です。');
+    Alert.alert('ファイル保存', 'ダウンロードフォルダへの保存にはストレージ権限が必要です。');
     return false;
   };
 
@@ -98,7 +99,7 @@ export default function App() {
     if (isChangingSetting) return;
     setIsChangingSetting(true);
     try {
-      if (delay === 0 || await ensureImagePermission()) setImageCaptureDelay(delay);
+      if (delay === 0 || await ensureDownloadPermission()) setImageCaptureDelay(delay);
     } catch (error) {
       Alert.alert('画像保存設定エラー', String(error));
     } finally {
@@ -111,7 +112,7 @@ export default function App() {
     if (scanBusy.current) return;
     setIsChangingSetting(true);
     try {
-      if (!cameraActive.current && imageCaptureDelay > 0 && !await ensureImagePermission()) return;
+      if (!cameraActive.current && imageCaptureDelay > 0 && !await ensureDownloadPermission()) return;
       cameraActive.current = !cameraActive.current;
       setIsCameraActive(cameraActive.current);
     } catch (error) {
@@ -170,6 +171,13 @@ export default function App() {
     const joinedCodes = qrCodes.join(',');
 
     try {
+      if (endpointUrl === '.' || endpointUrl === '-') {
+        if (!await ensureDownloadPermission()) return;
+        const fileName = await evidenceImages!.saveQrText(qrCodes, Date.now());
+        clearCodes();
+        Alert.alert('テキスト保存完了', `ダウンロード/${fileName}`);
+        return;
+      }
       const url = `${endpointUrl}?qr=${encodeURIComponent(joinedCodes)}`;
       const response = await fetch(url);
       const text = await response.text();

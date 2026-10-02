@@ -25,9 +25,16 @@ import {
 } from 'react-native-vision-camera';
 
 const STORAGE_KEY = 'endpointUrl';
-const IMAGE_DELAY_STORAGE_KEY = 'imageCaptureDelayMs';
-const IMAGE_CAPTURE_DELAYS = [0, 50, 75, 100, 250, 500] as const;
+const IMAGE_DELAY_STORAGE_KEY = 'imageCaptureDelayMsV2';
+const LEGACY_IMAGE_DELAY_STORAGE_KEY = 'imageCaptureDelayMs';
+const IMAGE_CAPTURE_DELAYS = [-1, 0, 50, 75, 100, 250, 500, 1000] as const;
 type ImageCaptureDelay = typeof IMAGE_CAPTURE_DELAYS[number];
+const imageCaptureDelayLabel = (delay: ImageCaptureDelay): string => {
+  if (delay === -1) return '保存なし';
+  if (delay === 0) return 'タップして保存';
+  if (delay === 1000) return '1 秒';
+  return `${delay} ms`;
+};
 const evidenceImages = NativeModules.EvidenceImages as {
   saveSnapshot(path: string, codes: string[], timestamp: number): Promise<void>;
   saveQrText(codes: string[], timestamp: number): Promise<string>;
@@ -38,14 +45,16 @@ export default function App() {
   const [isSending, setIsSending] = useState(false);
   const [endpointUrl, setEndpointUrl] = useState('http://192.168.0.1:1880/send_data');
   const [qrCodes, setQrCodes] = useState<string[]>([]);
-  const [imageCaptureDelay, setImageCaptureDelay] = useState<ImageCaptureDelay>(0);
+  const [imageCaptureDelay, setImageCaptureDelay] = useState<ImageCaptureDelay>(-1);
   const [isDelayPickerOpen, setIsDelayPickerOpen] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [isSavingImage, setIsSavingImage] = useState(false);
+  const [isAwaitingTap, setIsAwaitingTap] = useState(false);
   const [isChangingSetting, setIsChangingSetting] = useState(false);
   const cameraRef = useRef<Camera>(null);
   const scannedCodes = useRef(new Set<string>());
   const scanBusy = useRef(false);
+  const pendingCaptureTap = useRef<(() => void) | null>(null);
   const cameraActive = useRef(false);
 
   const device = useCameraDevice('back');
@@ -61,10 +70,16 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const stored = await AsyncStorage.multiGet([STORAGE_KEY, IMAGE_DELAY_STORAGE_KEY]);
+        const stored = await AsyncStorage.multiGet([
+          STORAGE_KEY, IMAGE_DELAY_STORAGE_KEY, LEGACY_IMAGE_DELAY_STORAGE_KEY,
+        ]);
         if (stored[0][1] !== null) setEndpointUrl(stored[0][1]);
-        const delay = Number(stored[1][1]);
-        setImageCaptureDelay(IMAGE_CAPTURE_DELAYS.find((value) => value === delay) ?? 0);
+        const savedDelay = stored[1][1];
+        const oldDelay = stored[2][1];
+        const delay = savedDelay !== null ? Number(savedDelay) : Number(oldDelay);
+        // In the old selector 0 meant no image. Preserve that meaning on upgrade.
+        const migratedDelay = savedDelay === null && (oldDelay === null || delay === 0) ? -1 : delay;
+        setImageCaptureDelay(IMAGE_CAPTURE_DELAYS.find((value) => value === migratedDelay) ?? -1);
       } catch (error) {
         Alert.alert('設定読み込みエラー', String(error));
       } finally {
@@ -99,7 +114,7 @@ export default function App() {
     if (isChangingSetting) return;
     setIsChangingSetting(true);
     try {
-      if (delay === 0 || await ensureDownloadPermission()) setImageCaptureDelay(delay);
+      if (delay === -1 || await ensureDownloadPermission()) setImageCaptureDelay(delay);
     } catch (error) {
       Alert.alert('画像保存設定エラー', String(error));
     } finally {
@@ -112,7 +127,7 @@ export default function App() {
     if (scanBusy.current) return;
     setIsChangingSetting(true);
     try {
-      if (!cameraActive.current && imageCaptureDelay > 0 && !await ensureDownloadPermission()) return;
+      if (!cameraActive.current && imageCaptureDelay >= 0 && !await ensureDownloadPermission()) return;
       cameraActive.current = !cameraActive.current;
       setIsCameraActive(cameraActive.current);
     } catch (error) {
@@ -140,22 +155,33 @@ export default function App() {
       newCodes.forEach((code) => scannedCodes.current.add(code));
       setQrCodes((prev) => [...prev, ...newCodes]);
       try {
-        if (imageCaptureDelay > 0) {
-          setIsSavingImage(true);
-          // Allow the camera preview to catch up with the QR recognition callback.
-          // Keep the scan lock held until capture and saving are complete.
-          await new Promise<void>((resolve) => setTimeout(resolve, imageCaptureDelay));
+        if (imageCaptureDelay >= 0) {
+          if (imageCaptureDelay === 0) {
+            Vibration.vibrate(100);
+            await new Promise<void>((resolve) => {
+              pendingCaptureTap.current = resolve;
+              setIsAwaitingTap(true);
+            });
+            setIsAwaitingTap(false);
+            setIsSavingImage(true);
+          } else {
+            setIsSavingImage(true);
+            // Allow the camera preview to catch up with the QR recognition callback.
+            await new Promise<void>((resolve) => setTimeout(resolve, imageCaptureDelay));
+          }
           if (!cameraRef.current || !evidenceImages) throw new Error('画像保存を開始できません。');
           const snapshot = await cameraRef.current.takeSnapshot({ quality: 35 });
           await evidenceImages.saveSnapshot(snapshot.path, newCodes, timestamp);
         }
-        Vibration.vibrate(100);
+        if (imageCaptureDelay !== 0) Vibration.vibrate(100);
       } catch (error) {
         // Keep the read data, but stop scanning so a missing image is visible.
         cameraActive.current = false;
         setIsCameraActive(false);
         Alert.alert('画像保存エラー', `QRデータは保持していますが、画像を保存できなかった可能性があります。\n${String(error)}`);
       } finally {
+        pendingCaptureTap.current = null;
+        setIsAwaitingTap(false);
         setIsSavingImage(false);
         scanBusy.current = false;
       }
@@ -244,20 +270,20 @@ export default function App() {
           <Button
             title={isCameraActive ? 'STOP' : 'START'}
             onPress={toggleCamera}
-            disabled={!settingsLoaded || isSending || isSavingImage || isChangingSetting}
+            disabled={!settingsLoaded || isSending || isSavingImage || isAwaitingTap || isChangingSetting}
           />
           <View style={{ width: 10 }} />
           <Button
             title="SEND"
             onPress={handleSend}
-            disabled={qrCodes.length === 0 || isSending || isSavingImage || isChangingSetting}
+            disabled={qrCodes.length === 0 || isSending || isSavingImage || isAwaitingTap || isChangingSetting}
           />
           <View style={{ width: 10 }} />
           <Button
             title="RESET"
             onPress={handleReset}
             color="red"
-            disabled={isSending || isSavingImage || isChangingSetting}
+            disabled={isSending || isSavingImage || isAwaitingTap || isChangingSetting}
           />
         </View>
 
@@ -267,7 +293,7 @@ export default function App() {
             value={endpointUrl}
             onChangeText={setEndpointUrl}
             placeholder="送信先URL"
-            editable={settingsLoaded && !isSending}
+            editable={settingsLoaded && !isSending && !isAwaitingTap && !isSavingImage}
             autoCapitalize="none"
             autoCorrect={false}
           />
@@ -276,15 +302,15 @@ export default function App() {
             style={styles.delayPicker}
             accessibilityRole="combobox"
             accessibilityLabel="画像保存のウエイト時間"
-            accessibilityValue={{ text: imageCaptureDelay === 0 ? '0、保存しない' : `${imageCaptureDelay}ミリ秒` }}
-            accessibilityState={{ expanded: isDelayPickerOpen, disabled: !settingsLoaded || isSavingImage || isChangingSetting || isSending }}
-            disabled={!settingsLoaded || isSavingImage || isChangingSetting || isSending}
+            accessibilityValue={{ text: imageCaptureDelayLabel(imageCaptureDelay) }}
+            accessibilityState={{ expanded: isDelayPickerOpen, disabled: !settingsLoaded || isSavingImage || isAwaitingTap || isChangingSetting || isSending }}
+            disabled={!settingsLoaded || isSavingImage || isAwaitingTap || isChangingSetting || isSending}
             onPress={() => {
               if (!scanBusy.current) setIsDelayPickerOpen(true);
             }}
           >
             <Text style={styles.delayValue} numberOfLines={1}>
-              {imageCaptureDelay === 0 ? '0（保存なし）' : `${imageCaptureDelay} ms`}
+              {imageCaptureDelay === 0 ? 'タップ保存' : imageCaptureDelayLabel(imageCaptureDelay)}
             </Text>
             <Text style={styles.delayArrow}>▼</Text>
           </Pressable>
@@ -318,7 +344,7 @@ export default function App() {
                   onPress={() => selectImageCaptureDelay(delay)}
                 >
                   <Text style={styles.delayOptionText}>
-                    {imageCaptureDelay === delay ? '●' : '○'}  {delay === 0 ? '0（保存しない）' : `${delay} ms`}
+                    {imageCaptureDelay === delay ? '●' : '○'}  {imageCaptureDelayLabel(delay)}
                   </Text>
                 </Pressable>
               ))}
@@ -357,6 +383,21 @@ export default function App() {
           />
         )}
       </View>
+
+      {isAwaitingTap && (
+        <Pressable
+          style={styles.tapToCaptureOverlay}
+          accessibilityRole="button"
+          accessibilityLabel="画面をタップして画像を保存"
+          onPress={() => {
+            const continueCapture = pendingCaptureTap.current;
+            pendingCaptureTap.current = null;
+            continueCapture?.();
+          }}
+        >
+          <Text style={styles.tapToCaptureText}>QRを読み取りました。画面をタップして画像を保存</Text>
+        </Pressable>
+      )}
     </View>
   );
 }
@@ -425,4 +466,18 @@ const styles = StyleSheet.create({
   delayTitle: { color: 'black', fontSize: 18, marginBottom: 8 },
   delayOption: { minHeight: 48, justifyContent: 'center' },
   delayOptionText: { color: 'black', fontSize: 16 },
+  tapToCaptureOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    paddingTop: 60,
+    paddingHorizontal: 16,
+  },
+  tapToCaptureText: {
+    color: 'white',
+    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    padding: 12,
+    textAlign: 'center',
+    fontSize: 16,
+  },
 });

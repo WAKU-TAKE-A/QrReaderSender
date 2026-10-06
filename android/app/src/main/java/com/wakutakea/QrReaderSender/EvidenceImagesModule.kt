@@ -3,6 +3,7 @@ package com.wakutakea.QrReaderSender
 import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.media.ExifInterface
 import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Environment
@@ -14,6 +15,7 @@ import java.io.File
 import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 /** Publishes camera JPEGs to public Downloads, without broad storage access on Android 10+. */
 class EvidenceImagesModule(private val context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {
@@ -103,18 +105,20 @@ class EvidenceImagesModule(private val context: ReactApplicationContext) : React
   }
 
   @ReactMethod
-  fun saveSnapshot(path: String, codes: ReadableArray, timestamp: Double, promise: Promise) {
+  fun savePhoto(path: String, codes: ReadableArray, timestamp: Double, promise: Promise) {
     val values = (0 until codes.size()).map { codes.getString(it) ?: "QR" }
     executor.execute {
       var source: File? = null
+      var compressed: File? = null
       try {
         val candidate = File(path).canonicalFile
         require(candidate.path.startsWith(context.cacheDir.canonicalPath + File.separator)) {
-          "Snapshot must be in the app cache"
+          "Photo must be in the app cache"
         }
         source = candidate
-        require(candidate.isFile) { "Snapshot file is missing" }
-        if (isNearlyBlackSnapshot(candidate)) throw BlackSnapshotException()
+        require(candidate.isFile) { "Photo file is missing" }
+        val prepared = compressPhoto(candidate)
+        compressed = prepared
         val usedNames = mutableSetOf<String>()
         for (code in values) {
           // Distinct QR values can have the same first 12 characters. Keep the requested
@@ -126,74 +130,69 @@ class EvidenceImagesModule(private val context: ReactApplicationContext) : React
           } while (!usedNames.add(name.lowercase(Locale.ROOT)))
           val folder = EvidenceImageNames.folder(time - 1)
           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            saveToDownloads(candidate, folder, name)
+            saveToDownloads(prepared, folder, name)
           } else {
-            saveToLegacyDownloads(candidate, folder, name)
+            saveToLegacyDownloads(prepared, folder, name)
           }
         }
         promise.resolve(null)
-      } catch (error: BlackSnapshotException) {
-        promise.reject("BLACK_SNAPSHOT", "プレビュー画像が黒いため保存しませんでした。", error)
       } catch (error: Exception) {
         promise.reject("IMAGE_SAVE_FAILED", "画像の保存に失敗しました: ${error.message}", error)
       } finally {
+        compressed?.delete()
         source?.delete()
       }
     }
   }
 
-  /**
-   * Snapshot is based on the preview surface.  A surface that has not drawn yet can produce an
-   * all-black JPEG, so inspect a small decoded copy before publishing it to Downloads.
-   *
-   * This intentionally only rejects an almost completely black image. A normal dark scene is
-   * retained as evidence rather than being treated as a camera failure.
-   */
-  private fun isNearlyBlackSnapshot(source: File): Boolean {
+  /** Keep the saved JPEG within HD bounds even when the camera selects a larger photo format. */
+  private fun compressPhoto(source: File): File {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     BitmapFactory.decodeFile(source.path, bounds)
     if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-      throw IOException("Snapshot JPEG could not be decoded")
+      throw IOException("Photo JPEG could not be decoded")
     }
-
+    val maxWidth = if (bounds.outWidth >= bounds.outHeight) 1280 else 720
+    val maxHeight = if (bounds.outWidth >= bounds.outHeight) 720 else 1280
+    var sampleSize = 1
+    while (bounds.outWidth / (sampleSize * 2) >= maxWidth && bounds.outHeight / (sampleSize * 2) >= maxHeight) {
+      sampleSize *= 2
+    }
     val options = BitmapFactory.Options().apply {
-      inSampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, 160)
-      inPreferredConfig = Bitmap.Config.RGB_565
+      inSampleSize = sampleSize
     }
     val bitmap = BitmapFactory.decodeFile(source.path, options)
-      ?: throw IOException("Snapshot JPEG could not be decoded")
+      ?: throw IOException("Photo JPEG could not be decoded")
     try {
-      var samples = 0
-      var darkSamples = 0
-      var totalLuma = 0L
-      val stepX = maxOf(1, bitmap.width / 32)
-      val stepY = maxOf(1, bitmap.height / 32)
-      var y = 0
-      while (y < bitmap.height) {
-        var x = 0
-        while (x < bitmap.width) {
-          val pixel = bitmap.getPixel(x, y)
-          val luma = (299 * ((pixel shr 16) and 0xff) + 587 * ((pixel shr 8) and 0xff) + 114 * (pixel and 0xff)) / 1000
-          totalLuma += luma
-          if (luma <= 12) darkSamples += 1
-          samples += 1
-          x += stepX
+      val scale = minOf(1.0, maxWidth.toDouble() / bitmap.width, maxHeight.toDouble() / bitmap.height)
+      val resized = if (scale < 1.0) {
+        Bitmap.createScaledBitmap(bitmap, maxOf(1, (bitmap.width * scale).roundToInt()), maxOf(1, (bitmap.height * scale).roundToInt()), true)
+      } else bitmap
+      try {
+        val output = File.createTempFile("evidence-photo-", ".jpg", context.cacheDir)
+        try {
+          output.outputStream().use { stream ->
+            if (!resized.compress(Bitmap.CompressFormat.JPEG, 50, stream)) throw IOException("Photo JPEG could not be compressed")
+          }
+          val orientation = ExifInterface(source.path).getAttribute(ExifInterface.TAG_ORIENTATION)
+          if (orientation != null) {
+            ExifInterface(output.path).apply {
+              setAttribute(ExifInterface.TAG_ORIENTATION, orientation)
+              saveAttributes()
+            }
+          }
+          return output
+        } catch (error: Exception) {
+          output.delete()
+          throw error
         }
-        y += stepY
+      } finally {
+        if (resized !== bitmap) resized.recycle()
       }
-      return samples > 0 && totalLuma.toDouble() / samples <= 5.0 && darkSamples.toDouble() / samples >= 0.99
     } finally {
       bitmap.recycle()
     }
   }
-
-  private fun calculateInSampleSize(width: Int, height: Int, maxDimension: Int): Int {
-    var sampleSize = 1
-    while (width / sampleSize > maxDimension || height / sampleSize > maxDimension) sampleSize *= 2
-    return sampleSize
-  }
-
-  private class BlackSnapshotException : IOException("Snapshot preview was nearly black")
 
   @android.annotation.TargetApi(Build.VERSION_CODES.Q)
   private fun saveToDownloads(source: File, folder: String, name: String) {

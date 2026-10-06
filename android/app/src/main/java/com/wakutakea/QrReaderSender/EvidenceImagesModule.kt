@@ -1,6 +1,8 @@
 package com.wakutakea.QrReaderSender
 
 import android.content.ContentValues
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaScannerConnection
 import android.os.Build
 import android.os.Environment
@@ -112,6 +114,7 @@ class EvidenceImagesModule(private val context: ReactApplicationContext) : React
         }
         source = candidate
         require(candidate.isFile) { "Snapshot file is missing" }
+        if (isNearlyBlackSnapshot(candidate)) throw BlackSnapshotException()
         val usedNames = mutableSetOf<String>()
         for (code in values) {
           // Distinct QR values can have the same first 12 characters. Keep the requested
@@ -129,6 +132,8 @@ class EvidenceImagesModule(private val context: ReactApplicationContext) : React
           }
         }
         promise.resolve(null)
+      } catch (error: BlackSnapshotException) {
+        promise.reject("BLACK_SNAPSHOT", "プレビュー画像が黒いため保存しませんでした。", error)
       } catch (error: Exception) {
         promise.reject("IMAGE_SAVE_FAILED", "画像の保存に失敗しました: ${error.message}", error)
       } finally {
@@ -136,6 +141,59 @@ class EvidenceImagesModule(private val context: ReactApplicationContext) : React
       }
     }
   }
+
+  /**
+   * Snapshot is based on the preview surface.  A surface that has not drawn yet can produce an
+   * all-black JPEG, so inspect a small decoded copy before publishing it to Downloads.
+   *
+   * This intentionally only rejects an almost completely black image. A normal dark scene is
+   * retained as evidence rather than being treated as a camera failure.
+   */
+  private fun isNearlyBlackSnapshot(source: File): Boolean {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(source.path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+      throw IOException("Snapshot JPEG could not be decoded")
+    }
+
+    val options = BitmapFactory.Options().apply {
+      inSampleSize = calculateInSampleSize(bounds.outWidth, bounds.outHeight, 160)
+      inPreferredConfig = Bitmap.Config.RGB_565
+    }
+    val bitmap = BitmapFactory.decodeFile(source.path, options)
+      ?: throw IOException("Snapshot JPEG could not be decoded")
+    try {
+      var samples = 0
+      var darkSamples = 0
+      var totalLuma = 0L
+      val stepX = maxOf(1, bitmap.width / 32)
+      val stepY = maxOf(1, bitmap.height / 32)
+      var y = 0
+      while (y < bitmap.height) {
+        var x = 0
+        while (x < bitmap.width) {
+          val pixel = bitmap.getPixel(x, y)
+          val luma = (299 * ((pixel shr 16) and 0xff) + 587 * ((pixel shr 8) and 0xff) + 114 * (pixel and 0xff)) / 1000
+          totalLuma += luma
+          if (luma <= 12) darkSamples += 1
+          samples += 1
+          x += stepX
+        }
+        y += stepY
+      }
+      return samples > 0 && totalLuma.toDouble() / samples <= 5.0 && darkSamples.toDouble() / samples >= 0.99
+    } finally {
+      bitmap.recycle()
+    }
+  }
+
+  private fun calculateInSampleSize(width: Int, height: Int, maxDimension: Int): Int {
+    var sampleSize = 1
+    while (width / sampleSize > maxDimension || height / sampleSize > maxDimension) sampleSize *= 2
+    return sampleSize
+  }
+
+  private class BlackSnapshotException : IOException("Snapshot preview was nearly black")
 
   @android.annotation.TargetApi(Build.VERSION_CODES.Q)
   private fun saveToDownloads(source: File, folder: String, name: String) {

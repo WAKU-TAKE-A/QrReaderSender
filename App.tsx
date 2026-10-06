@@ -28,6 +28,8 @@ const STORAGE_KEY = 'endpointUrl';
 const IMAGE_DELAY_STORAGE_KEY = 'imageCaptureDelayMsV2';
 const LEGACY_IMAGE_DELAY_STORAGE_KEY = 'imageCaptureDelayMs';
 const IMAGE_CAPTURE_DELAYS = [-1, 0, 50, 75, 100, 250, 500, 1000] as const;
+const MAX_BLACK_SNAPSHOT_RETRIES = 3;
+const BLACK_SNAPSHOT_RETRY_DELAY_MS = 100;
 type ImageCaptureDelay = typeof IMAGE_CAPTURE_DELAYS[number];
 const imageCaptureDelayLabel = (delay: ImageCaptureDelay): string => {
   if (delay === -1) return '保存なし';
@@ -39,6 +41,10 @@ const evidenceImages = NativeModules.EvidenceImages as {
   saveSnapshot(path: string, codes: string[], timestamp: number): Promise<void>;
   saveQrText(codes: string[], timestamp: number): Promise<string>;
 } | undefined;
+
+const isBlackSnapshotError = (error: unknown): boolean =>
+  typeof error === 'object' && error !== null &&
+  (error as { code?: unknown }).code === 'BLACK_SNAPSHOT';
 
 export default function App() {
   const [isCameraActive, setIsCameraActive] = useState(false);
@@ -142,6 +148,12 @@ export default function App() {
     setQrCodes([]);
   };
 
+  const discardCodes = (codes: string[]) => {
+    const discarded = new Set(codes);
+    codes.forEach((code) => scannedCodes.current.delete(code));
+    setQrCodes((previous) => previous.filter((code) => !discarded.has(code)));
+  };
+
   const codeScanner = useCodeScanner({
     codeTypes: ['qr'],
     onCodeScanned: async (codes) => {
@@ -170,15 +182,26 @@ export default function App() {
             await new Promise<void>((resolve) => setTimeout(resolve, imageCaptureDelay));
           }
           if (!cameraRef.current || !evidenceImages) throw new Error('画像保存を開始できません。');
-          const snapshot = await cameraRef.current.takeSnapshot({ quality: 35 });
-          await evidenceImages.saveSnapshot(snapshot.path, newCodes, timestamp);
+          for (let retry = 0; ; retry += 1) {
+            const snapshot = await cameraRef.current.takeSnapshot({ quality: 35 });
+            try {
+              await evidenceImages.saveSnapshot(snapshot.path, newCodes, timestamp);
+              break;
+            } catch (error) {
+              if (!isBlackSnapshotError(error) || retry >= MAX_BLACK_SNAPSHOT_RETRIES) throw error;
+              await new Promise<void>((resolve) => setTimeout(resolve, BLACK_SNAPSHOT_RETRY_DELAY_MS));
+            }
+          }
         }
         if (imageCaptureDelay !== 0) Vibration.vibrate(100);
       } catch (error) {
-        // Keep the read data, but stop scanning so a missing image is visible.
+        if (imageCaptureDelay >= 0) discardCodes(newCodes);
         cameraActive.current = false;
         setIsCameraActive(false);
-        Alert.alert('画像保存エラー', `QRデータは保持していますが、画像を保存できなかった可能性があります。\n${String(error)}`);
+        const message = isBlackSnapshotError(error)
+          ? `黒いプレビュー画像が続いたため、QRデータと画像を破棄しました。\n${String(error)}`
+          : `画像を保存できなかったため、今回読み取ったQRデータを破棄しました。\n${String(error)}`;
+        Alert.alert('画像保存エラー', message);
       } finally {
         pendingCaptureTap.current = null;
         setIsAwaitingTap(false);
